@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# Credit: https://stackoverflow.com/a/246128
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+RAW_OUTFILE="${SCRIPT_DIR}/noinstr.raw"
+
+pushd ${SCRIPT_DIR}/.. > /dev/null
+grep -r noinstr * 2>/dev/null       \
+    | grep -v  ^Documentation       \
+    | grep -v  ^scripts             \
+    | grep -v  ^tools               \
+    | grep -vE ":\s*\*"             \
+    | grep -vE ":\s*//"             \
+    | grep -vE ":\s*/\*"            \
+    | grep -vE ":\s*# "             \
+    | grep -vE "\s*=\s*"            \
+    | grep -vE ":\s*return"         \
+    | grep -v  "__noinstr_"         \
+    | grep -vE \.S":"               \
+    | grep -v  "Kconfig:"           \
+    | grep -vE ":\s*if"             \
+    | grep -vE ":\s*&"              \
+    | grep -vE ":noinstr static$"                       \
+    | grep -vE ":asmlinkage noinstr unsigned long$"     \
+    | grep -vE ":static noinstr struct lock_class \*$"  \
+    | grep -vE ":#define __trap_section noinstr$"       \
+    | grep -vE ":\s*void \*noinstr_text_start;$"        \
+    | grep -vE ":\s*unsigned int noinstr_text_size;$"   \
+    | grep -vE ":DEFINE_ASM_FUNC"                       \
+    | grep -vE "_##"                                    \
+    > ${RAW_OUTFILE}
+
+# Multiline stuff. There are only a handfule of these, and I am hoping I can be
+# lazy and only find this stuff by string matching...
+echo "lib/smp_processor_id.c:noinstr static unsigned int check_preemption_disabled(const char *what1, const char *what2)" >> ${RAW_OUTFILE}
+echo "arch/arm64/kernel/entry-common.c:asmlinkage noinstr unsigned long __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)" >> ${RAW_OUTFILE}
+echo "kernel/locking/lockdep.c:static noinstr struct lock_class * look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)" >> ${RAW_OUTFILE}
+
+cat ${RAW_OUTFILE}
+popd > /dev/null
+
+# Manually filter these lines.
+# arch/riscv/kernel/traps.c:#define __trap_section noinstr
+# include/linux/module.h:	void *noinstr_text_start;
+# include/linux/module.h:	unsigned int noinstr_text_size;
+
+
+# Manual Follow-ups
+# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_save_fl, "pushf; pop %rax", .noinstr.text);
+# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_irq_disable, "cli", .noinstr.text);
+# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_irq_enable, "sti", .noinstr.text);
+# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_read_cr2, "mov %cr2, %rax", .noinstr.text);
+# arch/s390/include/asm/uaccess.h:__put_user_##type##_noinstr(unsigned type __user *to,			\
+# arch/s390/include/asm/uaccess.h:__put_user_##type##_noinstr(unsigned type __user *to,			\
+# arch/s390/include/asm/uaccess.h:__get_user_##type##_noinstr(unsigned type *to,				\
+# arch/s390/include/asm/uaccess.h:__get_user_##type##_noinstr(unsigned type *to,				\
+# arch/x86/include/asm/idtentry.h:noinstr void fred_##func(struct pt_regs *regs)
+# arch/x86/include/asm/idtentry.h:	__visible noinstr void kernel_##func(struct pt_regs *regs, unsigned long error_code);	\
+# arch/x86/include/asm/idtentry.h:	__visible noinstr void   user_##func(struct pt_regs *regs, unsigned long error_code)
+# arch/arm64/kernel/entry-common.c:asmlinkage void noinstr el##_##regsize##_##vector##_handler(struct pt_regs *regs)	\
