@@ -2,7 +2,8 @@
 
 # Credit: https://stackoverflow.com/a/246128
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-RAW_OUTFILE="${SCRIPT_DIR}/noinstr.raw"
+OUTFILE_RAW="${SCRIPT_DIR}/noinstr.raw"
+OUTFILE_FUNCS="${SCRIPT_DIR}/noinstr.funcs"
 
 pushd ${SCRIPT_DIR}/.. > /dev/null
 grep -r noinstr * 2>/dev/null       \
@@ -28,15 +29,17 @@ grep -r noinstr * 2>/dev/null       \
     | grep -vE ":\s*unsigned int noinstr_text_size;$"   \
     | grep -vE ":DEFINE_ASM_FUNC"                       \
     | grep -vE "_##"                                    \
-    > ${RAW_OUTFILE}
+    | grep -vE ":__visible noinstr void func\("         \
+    > ${OUTFILE_RAW}
 
 # Multiline stuff. There are only a handfule of these, and I am hoping I can be
 # lazy and only find this stuff by string matching...
-echo "lib/smp_processor_id.c:noinstr static unsigned int check_preemption_disabled(const char *what1, const char *what2)" >> ${RAW_OUTFILE}
-echo "arch/arm64/kernel/entry-common.c:asmlinkage noinstr unsigned long __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)" >> ${RAW_OUTFILE}
-echo "kernel/locking/lockdep.c:static noinstr struct lock_class * look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)" >> ${RAW_OUTFILE}
+echo "lib/smp_processor_id.c:noinstr static unsigned int check_preemption_disabled(const char *what1, const char *what2)" >> ${OUTFILE_RAW}
+echo "arch/arm64/kernel/entry-common.c:asmlinkage noinstr unsigned long __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)" >> ${OUTFILE_RAW}
+echo "kernel/locking/lockdep.c:static noinstr struct lock_class * look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)" >> ${OUTFILE_RAW}
 
-cat ${RAW_OUTFILE}
+# Extract the function names.
+cat ${OUTFILE_RAW} | sed 's/^.*://; s/(.*$//; s/.* \**\([A-Za-z0-9_]*\)$/\1/' | sort | uniq > ${OUTFILE_FUNCS}
 popd > /dev/null
 
 # Manually filter these lines.
@@ -58,3 +61,11 @@ popd > /dev/null
 # arch/x86/include/asm/idtentry.h:	__visible noinstr void kernel_##func(struct pt_regs *regs, unsigned long error_code);	\
 # arch/x86/include/asm/idtentry.h:	__visible noinstr void   user_##func(struct pt_regs *regs, unsigned long error_code)
 # arch/arm64/kernel/entry-common.c:asmlinkage void noinstr el##_##regsize##_##vector##_handler(struct pt_regs *regs)	\
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)			\
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs,			\
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs, unsigned long error_code)
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs,			\
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)			\
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)			\
+# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs,			\
