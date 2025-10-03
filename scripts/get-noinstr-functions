@@ -2,50 +2,78 @@
 
 # Credit: https://stackoverflow.com/a/246128
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-OUTFILE_RAW="${SCRIPT_DIR}/noinstr.raw"
-OUTFILE_FUNCS="${SCRIPT_DIR}/noinstr.funcs"
+NOINSTR_RAW="${SCRIPT_DIR}/noinstr.raw"
+NOINSTR_FUNCS="${SCRIPT_DIR}/noinstr.funcs"
+NOINSTR_FUNCS_USAGE="${SCRIPT_DIR}/noinstr.funcs.uses"
+GREP="grep"
+
 
 pushd ${SCRIPT_DIR}/.. > /dev/null
-grep -r noinstr * 2>/dev/null       \
-    | grep -v  ^Documentation       \
-    | grep -v  ^scripts             \
-    | grep -v  ^tools               \
-    | grep -vE ":\s*\*"             \
-    | grep -vE ":\s*//"             \
-    | grep -vE ":\s*/\*"            \
-    | grep -vE ":\s*# "             \
-    | grep -vE "\s*=\s*"            \
-    | grep -vE ":\s*return"         \
-    | grep -v  "__noinstr_"         \
-    | grep -vE \.S":"               \
-    | grep -v  "Kconfig:"           \
-    | grep -vE ":\s*if"             \
-    | grep -vE ":\s*&"              \
-    | grep -vE ":noinstr static$"                       \
-    | grep -vE ":asmlinkage noinstr unsigned long$"     \
-    | grep -vE ":static noinstr struct lock_class \*$"  \
-    | grep -vE ":#define __trap_section noinstr$"       \
-    | grep -vE ":\s*void \*noinstr_text_start;$"        \
-    | grep -vE ":\s*unsigned int noinstr_text_size;$"   \
-    | grep -vE ":DEFINE_ASM_FUNC"                       \
-    | grep -vE "_##"                                    \
-    | grep -vE ":__visible noinstr void func\("         \
-    > ${OUTFILE_RAW}
+${GREP} -r noinstr * 2>/dev/null       \
+    | ${GREP} -v  ^Documentation       \
+    | ${GREP} -v  ^scripts             \
+    | ${GREP} -v  ^tools               \
+    | ${GREP} -vE ":\s*\*"             \
+    | ${GREP} -vE ":\s*//"             \
+    | ${GREP} -vE ":\s*/\*"            \
+    | ${GREP} -vE ":\s*# "             \
+    | ${GREP} -vE "\s*=\s*"            \
+    | ${GREP} -vE ":\s*return"         \
+    | ${GREP} -v  "__noinstr_"         \
+    | ${GREP} -vE \.S":"               \
+    | ${GREP} -v  "Kconfig:"           \
+    | ${GREP} -vE ":\s*if"             \
+    | ${GREP} -vE ":\s*&"              \
+    | ${GREP} -vE ":noinstr static$"                       \
+    | ${GREP} -vE ":asmlinkage noinstr unsigned long$"     \
+    | ${GREP} -vE ":static noinstr struct lock_class \*$"  \
+    | ${GREP} -vE ":#define __trap_section noinstr$"       \
+    | ${GREP} -vE ":\s*void \*noinstr_text_start;$"        \
+    | ${GREP} -vE ":\s*unsigned int noinstr_text_size;$"   \
+    | ${GREP} -vE ":DEFINE_ASM_FUNC"                       \
+    | ${GREP} -vE "_##"                                    \
+    | ${GREP} -vE ":__visible noinstr void func\("         \
+    > ${NOINSTR_RAW}
 
-# Multiline stuff. There are only a handfule of these, and I am hoping I can be
-# lazy and only find this stuff by string matching...
-echo "lib/smp_processor_id.c:noinstr static unsigned int check_preemption_disabled(const char *what1, const char *what2)" >> ${OUTFILE_RAW}
-echo "arch/arm64/kernel/entry-common.c:asmlinkage noinstr unsigned long __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)" >> ${OUTFILE_RAW}
-echo "kernel/locking/lockdep.c:static noinstr struct lock_class * look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)" >> ${OUTFILE_RAW}
-
-# Extract the function names.
-cat ${OUTFILE_RAW} | sed 's/^.*://; s/(.*$//; s/.* \**\([A-Za-z0-9_]*\)$/\1/' | sort | uniq > ${OUTFILE_FUNCS}
-popd > /dev/null
-
-# Manually filter these lines.
+# These lines had to be manually filtered.
 # arch/riscv/kernel/traps.c:#define __trap_section noinstr
 # include/linux/module.h:	void *noinstr_text_start;
 # include/linux/module.h:	unsigned int noinstr_text_size;
+
+# Multiline stuff. There are only a handfule of these, and I am hoping I can be
+# lazy and only find this stuff by string matching...
+echo "lib/smp_processor_id.c:noinstr static unsigned int check_preemption_disabled(const char *what1, const char *what2)" >> ${NOINSTR_RAW}
+echo "arch/arm64/kernel/entry-common.c:asmlinkage noinstr unsigned long __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)" >> ${NOINSTR_RAW}
+echo "kernel/locking/lockdep.c:static noinstr struct lock_class * look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)" >> ${NOINSTR_RAW}
+
+# Extract the unique function names.
+cat ${NOINSTR_RAW} | sed 's/^.*://; s/(.*$//; s/.* \**\([A-Za-z0-9_]*\)$/\1/' | sort | uniq > ${NOINSTR_FUNCS}
+
+rm -f ${NOINSTR_FUNCS_USAGE}
+for FUNC in $(cat ${NOINSTR_FUNCS}); do
+    echo ${FUNC}
+    ${GREP} -r ${FUNC} 2>/dev/null     \
+        | ${GREP} -v ^Documentation    \
+        | ${GREP} -v ^scripts          \
+        | ${GREP} -v ^tools            \
+        | ${GREP} -E  "\s${FUNC}\("    \
+        | ${GREP} -v  "noinstr\s"      \
+        | ${GREP} -vE ":\s*${FUNC}"    \
+        | ${GREP} -vE ":\s*\*"         \
+        | ${GREP} -vE ":\s*/\*"        \
+        | ${GREP} -vE ":\s*//"         \
+        | ${GREP} -vE ":\s*return\s"   \
+        | ${GREP} -vE ":.*\s=\s"       \
+        | ${GREP} -vE ".*\s\|\|\s"     \
+        | ${GREP} -vE ":\s*if"         \
+        | ${GREP} -v  "Kconfig.*:"     \
+        | ${GREP} -vE ':\s*break;'     \
+        | ${GREP} -vE \.S":"           \
+        | ${GREP} -vE ":static unsigned long pte_.*/\*\supdated by ${FUNC}\(\)\s\*/"   \
+        >> ${NOINSTR_FUNCS_USAGE}
+done
+
+popd > /dev/null
 
 
 # Manual Follow-ups
