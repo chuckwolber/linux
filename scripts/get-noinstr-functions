@@ -5,6 +5,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 NOINSTR_RAW="${SCRIPT_DIR}/noinstr.raw"
 NOINSTR_FUNCS="${SCRIPT_DIR}/noinstr.funcs"
 NOINSTR_FUNCS_USAGE="${SCRIPT_DIR}/noinstr.funcs.uses"
+NOINSTR_FUNCS_TOFIND="${SCRIPT_DIR}/noinstr.funcs.tofind"
 GREP="grep"
 
 
@@ -72,6 +73,9 @@ for FUNC in $(cat ${NOINSTR_FUNCS}); do
         | ${GREP} -vE ":static unsigned long pte_.*/\*\supdated by ${FUNC}\(\)\s\*/"   \
         >> ${NOINSTR_FUNCS_USAGE}
 done
+
+# Extract the unique function names.
+cat ${NOINSTR_FUNCS_USAGE} | sed 's/^.*://; s/(.*$//; s/.* \**\([A-Za-z0-9_]*\)$/\1/' | sort | uniq > ${NOINSTR_FUNCS_TOFIND}
 
 popd > /dev/null
 
