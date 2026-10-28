@@ -1,103 +1,304 @@
-#!/bin/bash
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""Find source-level candidates for missing noinstr annotations.
 
-# Credit: https://stackoverflow.com/a/246128
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-NOINSTR_RAW="${SCRIPT_DIR}/noinstr.raw"
-NOINSTR_FUNCS="${SCRIPT_DIR}/noinstr.funcs"
-NOINSTR_FUNCS_USAGE="${SCRIPT_DIR}/noinstr.funcs.uses"
-NOINSTR_FUNCS_TOFIND="${SCRIPT_DIR}/noinstr.funcs.tofind"
-GREP="grep"
+Compare C definitions with same-name noinstr declarations/definitions. This is
+a lexical search, not a C parser or a configuration-aware instrumentation check.
+Both sides of preprocessor conditionals are searched. Names do not prove API
+identity, and attributes may be inherited from included declarations. Macro
+generated functions and unexpanded annotation wrappers need manual inspection.
 
+No source files are modified. Output goes to stdout; diagnostics go to stderr.
+Use --arch to reduce cross-architecture name collisions, and --objtool-log or
+--function to inspect callees that have no literal noinstr counterpart.
 
-pushd ${SCRIPT_DIR}/.. > /dev/null
-${GREP} -r noinstr * 2>/dev/null       \
-    | ${GREP} -v  ^Documentation       \
-    | ${GREP} -v  ^scripts             \
-    | ${GREP} -v  ^tools               \
-    | ${GREP} -vE ":\s*\*"             \
-    | ${GREP} -vE ":\s*//"             \
-    | ${GREP} -vE ":\s*/\*"            \
-    | ${GREP} -vE ":\s*# "             \
-    | ${GREP} -vE "\s*=\s*"            \
-    | ${GREP} -vE ":\s*return"         \
-    | ${GREP} -v  "__noinstr_"         \
-    | ${GREP} -vE \.S":"               \
-    | ${GREP} -v  "Kconfig:"           \
-    | ${GREP} -vE ":\s*if"             \
-    | ${GREP} -vE ":\s*&"              \
-    | ${GREP} -vE ":noinstr static$"                       \
-    | ${GREP} -vE ":asmlinkage noinstr unsigned long$"     \
-    | ${GREP} -vE ":static noinstr struct lock_class \*$"  \
-    | ${GREP} -vE ":#define __trap_section noinstr$"       \
-    | ${GREP} -vE ":\s*void \*noinstr_text_start;$"        \
-    | ${GREP} -vE ":\s*unsigned int noinstr_text_size;$"   \
-    | ${GREP} -vE ":DEFINE_ASM_FUNC"                       \
-    | ${GREP} -vE "_##"                                    \
-    | ${GREP} -vE ":__visible noinstr void func\("         \
-    > ${NOINSTR_RAW}
+__always_inline is reported separately from __no_profile: forcing inlining is
+not evidence that source-based coverage instrumentation has been suppressed.
+Validate candidates with the actual compiler, config, objtool, and object code.
+"""
 
-# These lines had to be manually filtered.
-# arch/riscv/kernel/traps.c:#define __trap_section noinstr
-# include/linux/module.h:	void *noinstr_text_start;
-# include/linux/module.h:	unsigned int noinstr_text_size;
-
-# Multiline stuff. There are only a handfule of these, and I am hoping I can be
-# lazy and only find this stuff by string matching...
-echo "lib/smp_processor_id.c:noinstr static unsigned int check_preemption_disabled(const char *what1, const char *what2)" >> ${NOINSTR_RAW}
-echo "arch/arm64/kernel/entry-common.c:asmlinkage noinstr unsigned long __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)" >> ${NOINSTR_RAW}
-echo "kernel/locking/lockdep.c:static noinstr struct lock_class * look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)" >> ${NOINSTR_RAW}
-
-# Extract the unique function names.
-cat ${NOINSTR_RAW} | sed 's/^.*://; s/(.*$//; s/.* \**\([A-Za-z0-9_]*\)$/\1/' | sort | uniq > ${NOINSTR_FUNCS}
-
-rm -f ${NOINSTR_FUNCS_USAGE}
-for FUNC in $(cat ${NOINSTR_FUNCS}); do
-    echo ${FUNC}
-    ${GREP} -r ${FUNC} 2>/dev/null     \
-        | ${GREP} -v ^Documentation    \
-        | ${GREP} -v ^scripts          \
-        | ${GREP} -v ^tools            \
-        | ${GREP} -E  "\s${FUNC}\("    \
-        | ${GREP} -v  "noinstr\s"      \
-        | ${GREP} -vE ":\s*${FUNC}"    \
-        | ${GREP} -vE ":\s*\*"         \
-        | ${GREP} -vE ":\s*/\*"        \
-        | ${GREP} -vE ":\s*//"         \
-        | ${GREP} -vE ":\s*return\s"   \
-        | ${GREP} -vE ":.*\s=\s"       \
-        | ${GREP} -vE ".*\s\|\|\s"     \
-        | ${GREP} -vE ":\s*if"         \
-        | ${GREP} -v  "Kconfig.*:"     \
-        | ${GREP} -vE ':\s*break;'     \
-        | ${GREP} -vE \.S":"           \
-        | ${GREP} -vE ":static unsigned long pte_.*/\*\supdated by ${FUNC}\(\)\s\*/"   \
-        >> ${NOINSTR_FUNCS_USAGE}
-done
-
-# Extract the unique function names.
-cat ${NOINSTR_FUNCS_USAGE} | sed 's/^.*://; s/(.*$//; s/.* \**\([A-Za-z0-9_]*\)$/\1/' | sort | uniq > ${NOINSTR_FUNCS_TOFIND}
-
-popd > /dev/null
+import argparse
+from bisect import bisect_right
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
 
 
-# Manual Follow-ups
-# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_save_fl, "pushf; pop %rax", .noinstr.text);
-# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_irq_disable, "cli", .noinstr.text);
-# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_irq_enable, "sti", .noinstr.text);
-# arch/x86/kernel/paravirt.c:DEFINE_ASM_FUNC(pv_native_read_cr2, "mov %cr2, %rax", .noinstr.text);
-# arch/s390/include/asm/uaccess.h:__put_user_##type##_noinstr(unsigned type __user *to,			\
-# arch/s390/include/asm/uaccess.h:__put_user_##type##_noinstr(unsigned type __user *to,			\
-# arch/s390/include/asm/uaccess.h:__get_user_##type##_noinstr(unsigned type *to,				\
-# arch/s390/include/asm/uaccess.h:__get_user_##type##_noinstr(unsigned type *to,				\
-# arch/x86/include/asm/idtentry.h:noinstr void fred_##func(struct pt_regs *regs)
-# arch/x86/include/asm/idtentry.h:	__visible noinstr void kernel_##func(struct pt_regs *regs, unsigned long error_code);	\
-# arch/x86/include/asm/idtentry.h:	__visible noinstr void   user_##func(struct pt_regs *regs, unsigned long error_code)
-# arch/arm64/kernel/entry-common.c:asmlinkage void noinstr el##_##regsize##_##vector##_handler(struct pt_regs *regs)	\
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)			\
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs,			\
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs, unsigned long error_code)
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs,			\
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)			\
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs)			\
-# arch/x86/include/asm/idtentry.h:__visible noinstr void func(struct pt_regs *regs,			\
+# Comments/literals are single tokens so their contents cannot become C syntax.
+TOKEN = re.compile(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|'
+                   r"'(?:\\.|[^'\\])*'|[A-Za-z_]\w*|[^\s]", re.S)
+IDENTIFIER = re.compile(r'[A-Za-z_]\w*\Z')
+NOINSTR = {'noinstr', '__noinstr_section'}
+ANNOTATIONS = NOINSTR | {'__always_inline', '__no_profile', 'notrace',
+                         '__no_sanitize_coverage', 'inline', '__inline__'}
+NON_FUNCTIONS = {'__attribute__', '__attribute', '__declspec', 'typeof',
+                 '__typeof__', 'asm', '__asm__', '_Static_assert', 'static_assert'}
+EXCLUDED = {'Documentation', 'scripts', 'tools', 'samples', 'usr'}
+
+
+@dataclass
+class Function:
+    name: str
+    path: str
+    line: int
+    kind: str
+    static: bool
+    annotations: list
+    signature: str
+
+
+def blank(match):
+    return re.sub(r'[^\n]', ' ', match.group())
+
+
+def prepare(source):
+    # Remove comments first so # inside a block comment cannot start a directive.
+    uncommented = TOKEN.sub(lambda m: blank(m) if m.group().startswith(('/*', '//'))
+                            else m.group(), source)
+    directives = []
+    offset = 0
+    lines = uncommented.splitlines(keepends=True)
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        start = offset
+        offset += len(line)
+        i += 1
+        if not line.lstrip().startswith('#'):
+            continue
+        logical = line
+        while line.rstrip('\r\n').endswith('\\') and i < len(lines):
+            line = lines[i]
+            logical += line
+            offset += len(line)
+            i += 1
+        directives.append((start, offset, logical))
+    chars = list(uncommented)
+    macros = []
+    aliases = set(NOINSTR)
+    for start, end, logical in directives:
+        definition = re.match(r'\s*#\s*define\s+([A-Za-z_]\w*)(.*)',
+                              logical.replace('\\\n', ' '), re.S)
+        if definition:
+            macros.append((start, definition[1], definition[2].strip()))
+        chars[start:end] = ['\n' if c == '\n' else ' ' for c in chars[start:end]]
+    # Only trivial object-like aliases, local to this file. Conditional aliases
+    # are hints, not evidence of their expansion in any particular build.
+    changed = True
+    while changed:
+        changed = False
+        for _, name, replacement in macros:
+            if replacement in aliases and name not in aliases:
+                aliases.add(name)
+                changed = True
+    return ''.join(chars), macros, aliases
+
+
+def parse_signature(tokens, path, line, aliases):
+    values = [value for value, _ in tokens]
+    if not values or any(v in values for v in ('=', 'typedef')):
+        return None
+    depth = 0
+    for i, value in enumerate(values):
+        if value == '(':
+            # A direct function declarator has a name and a nonempty type prefix.
+            if (depth == 0 and i >= 2 and IDENTIFIER.fullmatch(values[i - 1])
+                    and values[i - 1] not in NON_FUNCTIONS | ANNOTATIONS
+                    and values[i - 1] not in {'__section', '__aligned'}):
+                candidate = i
+                break
+            depth += 1
+        elif value == ')':
+            depth -= 1
+    else:
+        return None
+    depth = 1
+    end = candidate + 1
+    while end < len(values) and depth:
+        depth += (values[end] == '(') - (values[end] == ')')
+        end += 1
+    if depth:
+        return None
+    # Exclude function-pointer variables and multiple declarators.
+    if any(v in values[end:] for v in (',', '=')):
+        return None
+    attrs = values[:candidate - 1] + values[end:]
+    annotations = sorted(set(attrs) & ANNOTATIONS)
+    if set(attrs) & (aliases - NOINSTR):
+        annotations.append('noinstr-alias')
+    return Function(values[candidate - 1], path, line(tokens[candidate - 1][1]),
+                    '', 'static' in attrs, annotations,
+                    ' '.join(values))
+
+
+def scan(source, path):
+    code, macros, aliases = prepare(source)
+    newlines = [i for i, c in enumerate(source) if c == '\n']
+    line = lambda offset: bisect_right(newlines, offset) + 1
+    tokens = [(m.group(), m.start()) for m in TOKEN.finditer(code)]
+    functions = []
+    header = []
+    braces = 0
+    parens = 0
+    for value, offset in tokens:
+        if braces:
+            braces += (value == '{') - (value == '}')
+            continue
+        if value == '(':
+            parens += 1
+        elif value == ')':
+            parens -= 1
+        if value in (';', '{') and parens == 0:
+            function = parse_signature(header, path, line, aliases)
+            if function:
+                function.kind = 'definition' if value == '{' else 'declaration'
+                functions.append(function)
+            header = []
+            if value == '{':
+                braces = 1
+        elif value == '}':
+            header = []
+        else:
+            header.append((value, offset))
+    manual = []
+    for offset, name, replacement in macros:
+        if set(re.findall(r'[A-Za-z_]\w*', replacement)) & aliases:
+            manual.append({'path': path, 'line': line(offset), 'macro': name,
+                           'reason': 'annotation wrapper or macro-generated code'})
+    return functions, manual
+
+
+def git(root, *args, input=None):
+    result = subprocess.run(['git', '-C', str(root), *args], input=input,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode not in (0, 1) or (result.returncode == 1 and args[0] != 'grep'):
+        raise RuntimeError(result.stderr.decode(errors='replace').strip())
+    return result.stdout
+
+
+def matching_files(root, names, arch):
+    paths = ['*.c', '*.h'] + [':(exclude)%s/**' % p for p in sorted(EXCLUDED)]
+    # git grep searches tracked working-tree files, not generated build products.
+    data = git(root, 'grep', '-l', '-z', '-w', '-F', '-f', '-', '--', *paths,
+               input=('\n'.join(sorted(names)) + '\n').encode())
+    files = [p.decode() for p in data.split(b'\0') if p]
+    return sorted(p for p in files if not arch or not p.startswith('arch/')
+                  or p.startswith('arch/%s/' % arch))
+
+
+def architecture(path):
+    return path.split('/')[1] if path.startswith('arch/') else None
+
+
+def related(reference, candidate):
+    # Static functions in .c files have translation-unit-local names.
+    if reference.static and reference.path.endswith('.c'):
+        return reference.path == candidate.path
+    if candidate.static and candidate.path.endswith('.c'):
+        return reference.path == candidate.path
+    a, b = architecture(reference.path), architecture(candidate.path)
+    return not (a and b and a != b)
+
+
+def is_noinstr(function):
+    return bool(set(function.annotations) & NOINSTR)
+
+
+def has_noinstr_hint(function):
+    return is_noinstr(function) or 'noinstr-alias' in function.annotations
+
+
+def findings(functions, requested):
+    references = defaultdict(list)
+    for function in functions:
+        if has_noinstr_hint(function):
+            references[function.name].append(function)
+    result = []
+    for function in functions:
+        if function.kind != 'definition' or is_noinstr(function):
+            continue
+        matches = [r for r in references[function.name]
+                   if r is not function and related(r, function)]
+        if not matches and function.name not in requested:
+            continue
+        result.append({'function': asdict(function),
+                       'references': [asdict(r) for r in matches],
+                       'requested': function.name in requested})
+    return sorted(result, key=lambda f: (f['function']['name'], f['function']['path'],
+                                        f['function']['line']))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--source-dir', type=Path, default=Path(__file__).resolve().parent.parent,
+                        help='kernel Git working tree (default: parent of scripts/)')
+    parser.add_argument('--arch', help='search common code and this arch/ subdirectory')
+    parser.add_argument('--function', action='append', default=[], metavar='NAME',
+                        help='also inspect this name, even without a noinstr counterpart')
+    parser.add_argument('--objtool-log', type=Path,
+                        help='also inspect call targets in noinstr section warnings')
+    parser.add_argument('--json', action='store_true', help='emit structured report')
+    args = parser.parse_args()
+    try:
+        root = args.source_dir.resolve()
+        if not (root / 'include/linux/compiler_types.h').is_file():
+            parser.error('--source-dir must name a kernel source tree')
+        if args.arch and not (root / 'arch' / args.arch).is_dir():
+            parser.error('unknown architecture: %s' % args.arch)
+        requested = set(args.function)
+        if args.objtool_log:
+            requested.update(re.findall(r'call to ([A-Za-z_]\w*)\(\) leaves \.noinstr\.text',
+                                        args.objtool_log.read_text()))
+        if any(not IDENTIFIER.fullmatch(name) for name in requested):
+            parser.error('--function requires a C identifier')
+        functions = []
+        manual = []
+        seeds = matching_files(root, NOINSTR, args.arch)
+        for path in seeds:
+            found, notes = scan((root / path).read_text(errors='replace'), path)
+            functions.extend(found)
+            manual.extend(notes)
+        names = {f.name for f in functions if has_noinstr_hint(f)} | requested
+        if names:
+            for path in sorted(set(matching_files(root, names, args.arch)) - set(seeds)):
+                found, _ = scan((root / path).read_text(errors='replace'), path)
+                functions.extend(found)
+        candidates = findings(functions, requested)
+        missing = sorted(requested - {f.name for f in functions if f.kind == 'definition'})
+        report = {'scope': 'lexical candidates; no configuration or instrumentation proof',
+                  'source_dir': str(root), 'arch': args.arch, 'candidates': candidates,
+                  'manual_review': manual, 'requested_without_definition': missing}
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print('# Source candidates only; review API identity, config and inherited attributes.')
+            for finding in candidates:
+                f = finding['function']
+                print('%s:%d: %s [%s]' % (f['path'], f['line'], f['name'],
+                                           ', '.join(f['annotations']) or 'no explicit exclusions'))
+                for ref in finding['references']:
+                    print('  counterpart: %s:%d (%s; %s)' %
+                          (ref['path'], ref['line'], ref['kind'], ', '.join(ref['annotations'])))
+                if finding['requested']:
+                    print('  explicitly requested or named by objtool')
+            if manual:
+                print('# Annotation macros requiring manual review:')
+                for item in manual:
+                    print('%s:%d: macro %s' % (item['path'], item['line'], item['macro']))
+            for name in missing:
+                print('# No ordinary C definition found: %s' % name)
+        print('%d candidates; %d annotation macros; %d requested names without definitions' %
+              (len(candidates), len(manual), len(missing)), file=sys.stderr)
+        return 0
+    except (OSError, RuntimeError) as error:
+        print('%s: %s' % (parser.prog, error), file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
